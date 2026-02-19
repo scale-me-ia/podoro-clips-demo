@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Podoro Clip — GDIY × MAIF</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #0a0a0f;
+      color: #f0f0f5;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .card {
+      max-width: 560px;
+      width: 100%;
+      background: linear-gradient(135deg, #13131f 0%, #1a1a2e 100%);
+      border: 1px solid rgba(139, 92, 246, 0.3);
+      border-radius: 20px;
+      padding: 32px;
+      box-shadow: 0 0 60px rgba(139, 92, 246, 0.15), 0 20px 60px rgba(0,0,0,0.5);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(139, 92, 246, 0.15);
+      border: 1px solid rgba(139, 92, 246, 0.4);
+      color: #a78bfa;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 5px 12px;
+      border-radius: 999px;
+      margin-bottom: 20px;
+    }
+
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      background: #a78bfa;
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    .podcast-name {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #6b7280;
+      margin-bottom: 8px;
+    }
+
+    .episode-title {
+      font-size: 15px;
+      font-weight: 500;
+      color: #9ca3af;
+      margin-bottom: 24px;
+      line-height: 1.5;
+    }
+
+    .quote-block {
+      position: relative;
+      margin: 0 0 28px;
+    }
+
+    .quote-line {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background: linear-gradient(to bottom, #8b5cf6, #ec4899);
+      border-radius: 2px;
+    }
+
+    .quote-text {
+      padding-left: 20px;
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.4;
+      color: #ffffff;
+      letter-spacing: -0.01em;
+    }
+
+    .quote-sub {
+      padding-left: 20px;
+      margin-top: 12px;
+      font-size: 14px;
+      color: #9ca3af;
+      line-height: 1.6;
+    }
+
+    /* Audio player */
+    .player-section {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 18px 20px;
+      margin-bottom: 20px;
+    }
+
+    .player-label {
+      font-size: 11px;
+      color: #6b7280;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+
+    audio {
+      width: 100%;
+      height: 36px;
+      border-radius: 8px;
+      accent-color: #8b5cf6;
+    }
+
+    audio::-webkit-media-controls-panel {
+      background: transparent;
+    }
+
+    .cta {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      background: linear-gradient(135deg, #7c3aed, #db2777);
+      color: white;
+      font-weight: 600;
+      font-size: 14px;
+      text-decoration: none;
+      padding: 14px 24px;
+      border-radius: 12px;
+      transition: opacity 0.2s, transform 0.15s;
+      margin-bottom: 16px;
+    }
+
+    .cta:hover {
+      opacity: 0.92;
+      transform: translateY(-1px);
+    }
+
+    .footer {
+      text-align: center;
+      font-size: 12px;
+      color: #4b5563;
+    }
+
+    .footer a {
+      color: #6b7280;
+      text-decoration: none;
+    }
+
+    .footer a:hover {
+      color: #a78bfa;
+    }
+
+    .stat {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      color: #9ca3af;
+      margin-right: 6px;
+      margin-top: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">
+      <span class="badge-dot"></span>
+      Podoro Clip
+    </div>
+
+    <div class="podcast-name">Génération Do It Yourself</div>
+
+    <div class="episode-title">
+      Pascal Demurger — La décision qui a coûté 100 millions à la MAIF pendant le Covid
+    </div>
+
+    <div class="quote-block">
+      <div class="quote-line"></div>
+      <div class="quote-text">
+        "Quand le PDG de MAIF a choisi de perdre 100 millions plutôt que sa crédibilité"
+      </div>
+      <div class="quote-sub">
+        L'éthique comme avantage concurrentiel : refuser d'augmenter les primes pendant le Covid,
+        une décision contre-intuitive qui a renforcé la confiance client et différencié MAIF
+        de tous ses concurrents.
+      </div>
+    </div>
+
+    <div class="stat">🎯 Vision long terme</div>
+    <div class="stat">⚡ Leadership en crise</div>
+    <div class="stat">💰 −100M€ → +réputation</div>
+
+    <div style="margin-top: 24px;"></div>
+
+    <div class="player-section">
+      <div class="player-label">🎙️ Résumé audio — ElevenLabs</div>
+      <audio controls preload="none">
+        <source src="https://agypzrkevayucfvmawee.supabase.co/storage/v1/object/public/audio-summaries/summaries/9d16428e-d14f-4062-8d00-90447299ae1e.mp3" type="audio/mpeg" />
+        Votre navigateur ne supporte pas l'audio HTML5.
+      </audio>
+    </div>
+
+    <a class="cta" href="https://podoro.fr" target="_blank">
+      🎧 Écouter l'épisode complet sur Podoro
+    </a>
+
+    <div class="footer">
+      Clip généré par <a href="https://podoro.fr" target="_blank">Podoro</a> ·
+      Résumés intelligents des meilleurs podcasts business français
+    </div>
+  </div>
+</body>
+</html>
