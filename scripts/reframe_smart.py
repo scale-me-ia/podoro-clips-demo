@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Smart reframe: detect wide shots with 2 speakers, crop to active speaker.
-Uses Whisper word timestamps to determine who's talking per segment."""
+"""Smart reframe v3: smooth + always a face + hysteresis.
+
+Fixes:
+1. SMOOTH: exponential lerp (0.92/0.08) per frame — no snapping
+2. ALWAYS A FACE: last-known fallback + rolling 30-frame face buffer
+3. HYSTERESIS: don't switch target unless new face stable for >0.5s
+"""
 
 import sys
 import cv2
@@ -9,25 +14,36 @@ import subprocess
 import json
 import os
 import urllib.request
-import tempfile
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from collections import Counter, deque
 
 MODEL_PATH = "/tmp/blaze_face_short_range.tflite"
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
 
+# === TUNING CONSTANTS ===
+LERP_INERTIA = 0.92          # Fix 1: how much to keep old position (0.92 = very smooth)
+LERP_PULL = 1.0 - LERP_INERTIA  # 0.08 = gentle pull toward target
+HYSTERESIS_FRAMES = 15        # Fix 3: new target must be stable for N frames before switching
+FACE_BUFFER_SIZE = 30         # Fix 2: rolling buffer of recent face positions
+WIDE_SHOT_GAP = 0.3           # min gap between 2 faces to classify as "wide"
+DETECT_CONFIDENCE = 0.25      # low threshold to catch profiles/beards
+
+
 def ensure_model():
     if not os.path.exists(MODEL_PATH):
+        print(f"Downloading face detection model...")
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
 
-def analyze_video(video_path, sample_every=3):
-    """Detect faces per frame, classify as close-up vs wide shot."""
+
+def analyze_video(video_path, sample_every=2):
+    """Detect faces every N frames. Returns per-sample face data."""
     ensure_model()
     
     base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.FaceDetectorOptions(
-        base_options=base_options, min_detection_confidence=0.25
+        base_options=base_options, min_detection_confidence=DETECT_CONFIDENCE
     )
     detector = vision.FaceDetector.create_from_options(options)
     
@@ -37,7 +53,7 @@ def analyze_video(video_path, sample_every=3):
     fps = cap.get(cv2.CAP_PROP_FPS)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    frame_data = []  # (frame_idx, shot_type, faces_info)
+    samples = []
     frame_idx = 0
     
     while True:
@@ -54,166 +70,154 @@ def analyze_video(video_path, sample_every=3):
             for det in result.detections:
                 bbox = det.bounding_box
                 cx = (bbox.origin_x + bbox.width / 2) / w
-                cy = (bbox.origin_y + bbox.height / 2) / h
                 face_w = bbox.width / w
                 score = det.categories[0].score if det.categories else 0
-                faces.append({
-                    "cx": cx, "cy": cy, "w": face_w,
-                    "score": score, "side": "left" if cx < 0.5 else "right"
-                })
+                faces.append({"cx": cx, "w": face_w, "score": score})
             
-            if len(faces) >= 2:
-                # Sort by x position
-                faces.sort(key=lambda f: f["cx"])
-                gap = faces[-1]["cx"] - faces[0]["cx"]
-                
-                if gap > 0.3:  # Wide shot: faces far apart
-                    shot_type = "wide"
-                else:
-                    shot_type = "close"
-            elif len(faces) == 1:
-                shot_type = "close"
-            else:
-                shot_type = "noface"
+            # Sort by x
+            faces.sort(key=lambda f: f["cx"])
             
-            frame_data.append({
-                "frame": frame_idx, "time": frame_idx / fps,
-                "shot_type": shot_type, "faces": faces
-            })
+            samples.append({"frame": frame_idx, "faces": faces})
         
         frame_idx += 1
     
     cap.release()
     detector.close()
     
-    # Stats
-    wide_count = sum(1 for f in frame_data if f["shot_type"] == "wide")
-    close_count = sum(1 for f in frame_data if f["shot_type"] == "close")
-    noface_count = sum(1 for f in frame_data if f["shot_type"] == "noface")
-    print(f"Frames analyzed: {len(frame_data)} (wide: {wide_count}, close: {close_count}, noface: {noface_count})")
+    n_wide = sum(1 for s in samples if len(s["faces"]) >= 2 
+                 and s["faces"][-1]["cx"] - s["faces"][0]["cx"] > WIDE_SHOT_GAP)
+    n_close = sum(1 for s in samples if len(s["faces"]) == 1)
+    n_none = sum(1 for s in samples if len(s["faces"]) == 0)
+    print(f"Analyzed {len(samples)} samples (wide: {n_wide}, close: {n_close}, noface: {n_none})")
     
-    return frame_data, w, h, fps, total
+    return samples, w, h, fps, total
 
 
-def load_whisper_segments(json_path, time_offset=0.0):
-    """Load Whisper segments to know when speech happens."""
-    with open(json_path) as f:
-        data = json.load(f)
-    segments = []
-    for seg in data.get("segments", []):
-        segments.append({
-            "start": seg["start"] + time_offset,
-            "end": seg["end"] + time_offset,
-            "text": seg["text"].strip()
-        })
-    return segments
-
-
-def assign_speaker_heuristic(frame_data, whisper_segments=None):
-    """For wide shots and noface frames, decide which face to crop to.
+def compute_crop_positions(samples, src_w, src_h, fps, total_frames):
+    """Core algorithm: compute per-frame crop_x with smooth + hysteresis + fallback.
     
-    Strategy:
-    - Wide shots: pick the LARGER face (leaning in = speaking)
-    - Noface: use LAST KNOWN position (don't jump to center)
-    - With Whisper: alternate sides on segment boundaries (TODO: diarization)
+    Returns list of crop_x (int) for every frame.
     """
-    last_known_cx = None
-    last_known_side = None
-    
-    for fd in frame_data:
-        if fd["shot_type"] == "wide" and len(fd["faces"]) >= 2:
-            # Pick the face with the largest bounding box (most prominent)
-            biggest = max(fd["faces"], key=lambda f: f["w"])
-            fd["target_cx"] = biggest["cx"]
-            fd["target_side"] = biggest["side"]
-            last_known_cx = fd["target_cx"]
-            last_known_side = fd["target_side"]
-        elif fd["shot_type"] == "close" and fd["faces"]:
-            best = max(fd["faces"], key=lambda f: f["score"])
-            fd["target_cx"] = best["cx"]
-            fd["target_side"] = best["side"]
-            last_known_cx = fd["target_cx"]
-            last_known_side = fd["target_side"]
-        else:
-            # NOFACE: use last known position instead of defaulting to center
-            if last_known_cx is not None:
-                fd["target_cx"] = last_known_cx
-                fd["target_side"] = last_known_side
-            else:
-                fd["target_cx"] = 0.5
-                fd["target_side"] = "center"
-    
-    return frame_data
-
-
-def generate_crop_timeline(frame_data, src_w, src_h, fps, total_frames, 
-                            target_w=1080, target_h=1920, segment_duration=2.0):
-    """Generate smooth crop positions with segment-based decisions."""
-    
     crop_w = int(src_h * 9 / 16)
     crop_h = src_h
     if crop_w > src_w:
         crop_w = src_w
         crop_h = int(src_w * 16 / 9)
     
-    # Interpolate target_cx for all frames
-    frame_indices = [fd["frame"] for fd in frame_data]
-    target_cxs = [fd["target_cx"] for fd in frame_data]
-    all_cxs = np.interp(range(total_frames), frame_indices, target_cxs)
+    min_cx = crop_w / (2 * src_w)
+    max_cx = 1.0 - min_cx
     
-    # Smooth with large window to avoid jitter, but allow jumps on shot changes
-    # Use segment-based averaging: decide per 2-second segment
-    seg_frames = int(fps * segment_duration)
-    segment_targets = []
+    def clamp_cx(cx):
+        return max(min_cx, min(max_cx, cx))
     
-    for i in range(0, total_frames, seg_frames):
-        seg_cxs = all_cxs[i:i + seg_frames]
-        # Use median (robust to outliers)
-        median_cx = float(np.median(seg_cxs))
+    # --- Step 1: Build raw target_cx per sample ---
+    # With hysteresis + fallback
+    
+    face_buffer = deque(maxlen=FACE_BUFFER_SIZE)  # recent face cx values
+    current_target_cx = 0.5
+    candidate_cx = None
+    candidate_frames = 0
+    
+    raw_targets = []  # (frame_idx, target_cx)
+    
+    for s in samples:
+        faces = s["faces"]
+        frame = s["frame"]
         
-        # Snap to left or right face if clearly on one side
-        if median_cx < 0.35:
-            snap_cx = max(median_cx, crop_w / (2 * src_w))
-        elif median_cx > 0.65:
-            snap_cx = min(median_cx, 1.0 - crop_w / (2 * src_w))
+        if len(faces) == 0:
+            # FIX 2: No face → use buffer fallback
+            if face_buffer:
+                fallback_cx = float(np.median(list(face_buffer)))
+            else:
+                fallback_cx = current_target_cx
+            desired_cx = fallback_cx
+            # Don't update candidate — we're in fallback mode
+        
+        elif len(faces) == 1:
+            # Single face — straightforward
+            desired_cx = faces[0]["cx"]
+            face_buffer.append(desired_cx)
+            candidate_cx = None
+            candidate_frames = 0
+        
+        elif len(faces) >= 2:
+            gap = faces[-1]["cx"] - faces[0]["cx"]
+            
+            if gap > WIDE_SHOT_GAP:
+                # Wide shot: pick largest face (most prominent)
+                biggest = max(faces, key=lambda f: f["w"])
+                desired_cx = biggest["cx"]
+                face_buffer.append(desired_cx)
+            else:
+                # Close shot with multiple faces: pick best score
+                best = max(faces, key=lambda f: f["score"])
+                desired_cx = best["cx"]
+                face_buffer.append(desired_cx)
+                candidate_cx = None
+                candidate_frames = 0
+        
+        # FIX 3: Hysteresis — only switch target if new position is stable
+        desired_cx = clamp_cx(desired_cx)
+        
+        if abs(desired_cx - current_target_cx) > 0.15:
+            # Big jump — candidate for switch
+            if candidate_cx is not None and abs(desired_cx - candidate_cx) < 0.1:
+                candidate_frames += 1
+            else:
+                candidate_cx = desired_cx
+                candidate_frames = 1
+            
+            if candidate_frames >= HYSTERESIS_FRAMES:
+                # Stable enough — switch!
+                current_target_cx = candidate_cx
+                candidate_cx = None
+                candidate_frames = 0
+            # else: keep old target (ignore jitter)
         else:
-            snap_cx = median_cx
+            # Small movement — track smoothly, no hysteresis needed
+            current_target_cx = desired_cx
+            candidate_cx = None
+            candidate_frames = 0
         
-        for j in range(i, min(i + seg_frames, total_frames)):
-            segment_targets.append(snap_cx)
+        raw_targets.append((frame, current_target_cx))
     
-    # Smooth transitions between segments (ease in/out over 0.3s)
-    transition_frames = int(fps * 0.3)
-    smoothed = np.array(segment_targets[:total_frames], dtype=float)
+    # --- Step 2: Interpolate to all frames ---
+    if not raw_targets:
+        return [0] * total_frames, crop_w, crop_h
     
-    for i in range(1, len(smoothed)):
-        if abs(smoothed[i] - smoothed[i-1]) > 0.01:
-            # Smooth transition
-            start = max(0, i - transition_frames)
-            for j in range(start, min(i + transition_frames, len(smoothed))):
-                alpha = (j - start) / (2 * transition_frames)
-                alpha = min(1.0, max(0.0, alpha))
-                # Ease in-out
-                alpha = alpha * alpha * (3 - 2 * alpha)
-                smoothed[j] = smoothed[start] * (1 - alpha) + smoothed[i] * alpha
+    sample_frames = [t[0] for t in raw_targets]
+    sample_cxs = [t[1] for t in raw_targets]
+    all_target_cxs = np.interp(range(total_frames), sample_frames, sample_cxs)
     
-    # Convert to crop_x positions
+    # --- Step 3: FIX 1 — Exponential smoothing (lerp) ---
+    smoothed_cx = np.zeros(total_frames)
+    smoothed_cx[0] = all_target_cxs[0]
+    
+    for i in range(1, total_frames):
+        smoothed_cx[i] = LERP_INERTIA * smoothed_cx[i-1] + LERP_PULL * all_target_cxs[i]
+    
+    # --- Step 4: Convert to crop_x ---
     crop_positions = []
-    for cx in smoothed:
+    for cx in smoothed_cx:
         crop_x = int(cx * src_w - crop_w / 2)
         crop_x = max(0, min(crop_x, src_w - crop_w))
         crop_positions.append(crop_x)
     
+    # Stats
+    diffs = [abs(crop_positions[i] - crop_positions[i-1]) for i in range(1, len(crop_positions))]
+    max_jump = max(diffs) if diffs else 0
+    avg_move = np.mean(diffs) if diffs else 0
+    print(f"Crop stats: max_jump={max_jump}px, avg_move={avg_move:.1f}px/frame")
+    
     return crop_positions, crop_w, crop_h
 
 
-def reframe_with_dynamic_crop(input_path, output_path, crop_positions, crop_w, crop_h,
-                                src_w, src_h, fps, target_w=1080, target_h=1920):
-    """Apply dynamic crop using frame-by-frame processing."""
+def apply_dynamic_crop(input_path, output_path, crop_positions, crop_w, crop_h,
+                       src_w, src_h, fps, target_w=1080, target_h=1920):
+    """Frame-by-frame crop via ffmpeg pipe."""
     
     cap = cv2.VideoCapture(input_path)
     
-    # Use ffmpeg pipe for output
     cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -237,13 +241,8 @@ def reframe_with_dynamic_crop(input_path, output_path, crop_positions, crop_w, c
         if not ret:
             break
         
-        # Get crop position for this frame
-        if frame_idx < len(crop_positions):
-            crop_x = crop_positions[frame_idx]
-        else:
-            crop_x = crop_positions[-1] if crop_positions else 0
-        
-        # Crop
+        idx = min(frame_idx, len(crop_positions) - 1)
+        crop_x = crop_positions[idx]
         cropped = frame[0:crop_h, crop_x:crop_x + crop_w]
         
         try:
@@ -256,39 +255,26 @@ def reframe_with_dynamic_crop(input_path, output_path, crop_positions, crop_w, c
     cap.release()
     proc.stdin.close()
     proc.wait()
-    
-    print(f"Output: {output_path} ({frame_idx} frames processed)")
+    print(f"Output: {output_path} ({frame_idx} frames)")
 
 
 def reframe_smart(input_path, output_path, whisper_json=None, time_offset=0.0):
-    """Full smart reframe pipeline."""
-    print(f"=== Smart Reframe: {os.path.basename(input_path)} ===")
+    """Full pipeline."""
+    print(f"=== Reframe v3: {os.path.basename(input_path)} ===")
     
-    # 1. Analyze video
-    frame_data, src_w, src_h, fps, total = analyze_video(input_path)
+    samples, src_w, src_h, fps, total = analyze_video(input_path)
     
-    # 2. Load Whisper if available
-    whisper_segments = None
     if whisper_json and os.path.exists(whisper_json):
-        whisper_segments = load_whisper_segments(whisper_json, time_offset)
-        print(f"Loaded {len(whisper_segments)} Whisper segments")
+        with open(whisper_json) as f:
+            data = json.load(f)
+        print(f"Whisper: {len(data.get('segments', []))} segments loaded")
     
-    # 3. Assign speaker targets
-    frame_data = assign_speaker_heuristic(frame_data, whisper_segments)
-    
-    # Log target distribution
-    sides = [fd.get("target_side", "?") for fd in frame_data]
-    from collections import Counter
-    print(f"Target distribution: {dict(Counter(sides))}")
-    
-    # 4. Generate crop timeline
-    crop_positions, crop_w, crop_h = generate_crop_timeline(
-        frame_data, src_w, src_h, fps, total
+    crop_positions, crop_w, crop_h = compute_crop_positions(
+        samples, src_w, src_h, fps, total
     )
     
-    # 5. Apply dynamic crop
-    print(f"Applying dynamic crop ({crop_w}x{crop_h})...")
-    reframe_with_dynamic_crop(
+    print(f"Applying crop ({crop_w}x{crop_h}, {total} frames)...")
+    apply_dynamic_crop(
         input_path, output_path, crop_positions, crop_w, crop_h,
         src_w, src_h, fps
     )
@@ -301,5 +287,4 @@ if __name__ == "__main__":
     
     whisper_json = sys.argv[3] if len(sys.argv) > 3 else None
     time_offset = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
-    
     reframe_smart(sys.argv[1], sys.argv[2], whisper_json, time_offset)
