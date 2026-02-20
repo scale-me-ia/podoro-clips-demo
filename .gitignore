@@ -1,0 +1,22 @@
+# Video files (too large for git)
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.mp3
+
+# Keep results markdown
+!results/matrix.md
+
+# Node
+node_modules/
+dist/
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
