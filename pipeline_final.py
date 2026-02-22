@@ -37,11 +37,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 
-REFRAME_SCRIPT = os.path.join(os.path.dirname(__file__), "reframe_v2.py")
-SUBTITLES_SCRIPT = os.path.join(os.path.dirname(__file__), "subtitles.py")
+REFRAME_SCRIPT = os.path.join(os.path.dirname(__file__), "scripts", "reframe_v3.py")
+REFRAME_SCRIPT_V2 = os.path.join(os.path.dirname(__file__), "scripts", "reframe_v2.py")
+SUBTITLES_SCRIPT = os.path.join(os.path.dirname(__file__), "scripts", "subtitles.py")
 
-# Fallback script paths (from podoro-clips-v3)
-REFRAME_FALLBACK = "/tmp/podoro-clips-v3/agent-cadrage/reframe_v2.py"
+# Fallback: reframe_v2 if YOLO not available
+REFRAME_FALLBACK = os.path.join(os.path.dirname(__file__), "scripts", "reframe_v2.py")
 SUBTITLES_FALLBACK = "/tmp/podoro-clips-v3/agent-subtitles/subtitles.py"
 
 FACE_MODEL = "/tmp/blaze_face_short_range.tflite"
@@ -443,9 +444,13 @@ def produce_clip(highlight: dict, video_path: str, vtt_path: str, out_dir: str, 
         "-t", str(duration), "-c", "copy", raw_path
     ], check=True, capture_output=True)
 
-    # 2. Reframe B2
-    print(f"  [clip {clip_num}] Reframing (MediaPipe B2)...")
-    reframe_script = find_script("reframe_v2.py", REFRAME_FALLBACK)
+    # 2. Reframe (YOLO v3, fallback to MediaPipe v2)
+    print(f"  [clip {clip_num}] Reframing (YOLO v3)...")
+    if os.path.exists(REFRAME_SCRIPT):
+        reframe_script = REFRAME_SCRIPT
+    else:
+        print(f"  [clip {clip_num}] ⚠️  v3 not found, falling back to v2")
+        reframe_script = find_script("reframe_v2.py", REFRAME_FALLBACK)
     result = subprocess.run(
         [sys.executable, reframe_script, raw_path, b2_path],
         capture_output=True, text=True
