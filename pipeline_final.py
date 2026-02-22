@@ -48,7 +48,7 @@ SUBTITLES_FALLBACK = "/tmp/podoro-clips-v3/agent-subtitles/subtitles.py"
 FACE_MODEL = "/tmp/blaze_face_short_range.tflite"
 FONT_PATH = "/tmp/fonts/TypoldExtended-ExtraBold.otf"
 
-MIN_CLIP_DURATION = 20  # seconds — skip clips shorter than this
+MIN_CLIP_DURATION = 40  # seconds — skip clips shorter than this (sweet spot: 60-90s)
 MAX_CLIPS = 5           # top N clips to process
 
 
@@ -174,7 +174,7 @@ Analyse ce podcast en français et trouve les 5 meilleurs passages pour créer d
 Pour chaque passage, retourne un JSON avec :
 - start_time: "HH:MM:SS" (début)
 - end_time: "HH:MM:SS" (fin)
-- duration_seconds: durée en secondes (20-90s max)
+- duration_seconds: durée en secondes (60-90s idéal, 45s minimum)
 - hook_text: la phrase d'accroche
 - punchline: la fin percutante
 - why_viral: pourquoi ça va buzzer
@@ -226,7 +226,7 @@ def detect_highlights_gemini(audio_path: str, gemini_key: str) -> list:
 CLAUDE_HIGHLIGHT_PROMPT = """Tu es un expert en contenu viral pour les réseaux sociaux.
 Voici la transcription d'un podcast en français (avec timestamps en secondes).
 
-Identifie les 5 meilleurs passages pour des clips courts viraux (20-90 secondes).
+Identifie les 5 meilleurs passages pour des clips courts viraux (60-90 secondes idéal, 45s minimum). Chaque passage DOIT avoir un arc narratif COMPLET : hook + histoire + conclusion/chute.
 Critères : hook fort, arc narratif, émotion, punchline mémorable, autonomie.
 
 Transcription (format "[Xs] texte") :

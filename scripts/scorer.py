@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 3-Phase Viral Passage Scorer for French Podcast "Sans Permission"
-Finds the best 20-30 second clips for TikTok/Reels
+Finds the best 60-90 second clips for TikTok/Reels/YT Shorts
 """
 
 import os
@@ -18,7 +18,7 @@ import numpy as np
 
 @dataclass
 class Passage:
-    """Represents a 30-second passage with metadata"""
+    """Represents a 60-90 second passage with metadata"""
     start_time: float  # seconds
     end_time: float    # seconds
     text: str
@@ -82,9 +82,9 @@ def parse_vtt(vtt_path: str) -> List[Tuple[float, float, str]]:
 
 
 def build_passages(entries: List[Tuple[float, float, str]],
-                   target_duration: float = 30.0,
-                   min_duration: float = 20.0,
-                   max_duration: float = 45.0,
+                   target_duration: float = 75.0,
+                   min_duration: float = 45.0,
+                   max_duration: float = 90.0,
                    overlap: float = 10.0) -> List[Passage]:
     """
     Build passages with flexible duration (20-45s) that try to end at sentence boundaries.
@@ -534,7 +534,7 @@ def main():
 
     # Build passages
     print("\n🔨 Building 30s passages with 10s overlap...")
-    passages = build_passages(entries, target_duration=30.0, overlap=10.0)
+    passages = build_passages(entries, target_duration=75.0, overlap=20.0)
     print(f"Created {len(passages)} passages")
 
     # Phase 1: Text pre-filter
