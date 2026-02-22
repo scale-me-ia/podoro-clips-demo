@@ -562,7 +562,8 @@ def parse_args():
     parser.add_argument("input", help="Input video (16:9)")
     parser.add_argument("output", help="Output video (9:16)")
     parser.add_argument("--diarization", help="Diarization JSON file (speaker segments)", default=None)
-    parser.add_argument("--no-silence-cut", action="store_true", help="Skip silence cutting")
+    parser.add_argument("--no-silence-cut", action="store_true", default=True, help="Skip silence cutting (default: on, most clips are already edited)")
+    parser.add_argument("--silence-cut", action="store_true", help="Enable aggressive silence cutting (for raw unedited audio)")
     return parser.parse_args()
 
 
@@ -646,7 +647,7 @@ def main():
         print("\n[4/4] Detecting silences & final encode...")
         total_duration = get_duration(cfr_video)
         keep_segments = None
-        if not args.no_silence_cut:
+        if args.silence_cut:
             silences = detect_silences(cfr_video, total_duration=total_duration)
             keep_segments = build_silence_cut_filter(silences, total_duration)
         else:
