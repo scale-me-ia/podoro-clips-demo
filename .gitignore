@@ -22,3 +22,6 @@ __pycache__/
 .DS_Store
 yolov8n.pt
 results/
+
+# Demo clips (force-tracked)
+!demo/*.mp4
