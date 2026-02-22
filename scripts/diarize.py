@@ -65,7 +65,7 @@ def run_diarization(audio_path: str, hf_token: str = None, num_speakers: int = N
     print("  Loading pyannote pipeline...")
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        use_auth_token=token,
+        token=token,  # FIX #5: use_auth_token deprecated since transformers>=4.34
     )
 
     print("  Running diarization...")
@@ -130,7 +130,9 @@ def main():
     tmp_wav = None
 
     if ext not in (".wav",):
-        tmp_wav = tempfile.mktemp(suffix=".wav", prefix="diarize_")
+        # MEDIUM FIX #4: NamedTemporaryFile replaces deprecated mktemp() (TOCTOU race condition)
+        with tempfile.NamedTemporaryFile(suffix=".wav", prefix="diarize_", delete=False) as _f:
+            tmp_wav = _f.name
         print("  Extracting audio...")
         audio_path = extract_wav(input_path, tmp_wav)
 

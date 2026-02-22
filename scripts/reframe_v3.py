@@ -110,8 +110,8 @@ def detect_persons_pass(video_path: str):
             last_dets = dets
             all_detections.append(dets)
         else:
-            # Interpolate: use last detection
-            all_detections.append(last_dets)
+            # Interpolate: use last detection (copy to avoid shared-reference vote bias)
+            all_detections.append(list(last_dets))
 
         frame_idx += 1
 
@@ -194,7 +194,10 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h,
     max_move_px = int(src_w * MAX_MOVE_FRAC)
 
     current_subject_id = -1
-    current_subject_score = 0.0   # FIX #7 — track current subject's score for margin check
+    # CRITICAL FIX #1 — track base score (WITHOUT continuity) for hysteresis comparison.
+    # Using base score prevents the continuity bonus from inflating the threshold,
+    # which previously made it impossible for a new speaker to ever take over.
+    current_base_score = 0.0
     candidate_id = -1
     candidate_frames = 0
 
@@ -236,6 +239,7 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h,
         # Score each detection
         best_id = -1
         best_score = -1
+        best_base_score = -1   # CRITICAL FIX #1: base score WITHOUT continuity
         best_cx = src_w / 2
 
         for d in dets:
@@ -255,21 +259,53 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h,
                 if track_to_speaker[d['track_id']] == active_speaker:
                     speaker_score = 1.0
 
-            total = (size_score * W_SIZE +
-                     center_score * W_CENTER +
-                     continuity_score * W_CONTINUITY +
-                     speaker_score * W_SPEAKER)
+            # Base score = WITHOUT continuity (used for fair hysteresis comparison)
+            base_score = (size_score * W_SIZE +
+                          center_score * W_CENTER +
+                          speaker_score * W_SPEAKER)
+            total = base_score + continuity_score * W_CONTINUITY
 
             if total > best_score:
                 best_score = total
+                best_base_score = base_score
                 best_id = d['track_id']
                 best_cx = cx
 
-        # FIX #7 — Hysteresis with margin: only switch if new_score > current_score + HYSTERESIS_MARGIN
-        # and new subject has been consistently better for HYSTERESIS_SECONDS
+        # CRITICAL FIX #1 — Hysteresis compares BASE scores (without W_CONTINUITY bonus).
+        # Previously, current_subject_score was the TOTAL score (with continuity=1.0),
+        # which inflated the threshold so a new speaker could never beat it.
+        #
+        # Two-layer approach:
+        # 1. Compare base scores (no continuity) → fair comparison across all subjects.
+        # 2. If diarization already signals speaker changed, drop margin to 0 (trust the signal).
+        #
+        # Recompute current subject's base score freshly each frame (speaker_score may have changed).
+        current_det_base_score = 0.0
+        for d in dets:
+            if d['track_id'] == current_subject_id:
+                cx_c = (d['x1'] + d['x2']) / 2
+                area_c = (d['x2'] - d['x1']) * (d['y2'] - d['y1'])
+                size_c = min(area_c / frame_area * 10, 1.0)
+                center_c = 1.0 - abs(cx_c - src_w / 2) / (src_w / 2)
+                spk_c = 0.0
+                if active_speaker and track_to_speaker and current_subject_id in track_to_speaker:
+                    if track_to_speaker[current_subject_id] == active_speaker:
+                        spk_c = 1.0
+                current_det_base_score = size_c * W_SIZE + center_c * W_CENTER + spk_c * W_SPEAKER
+                break
+
+        # Drop hysteresis margin to 0 when diarization already says this subject is NOT the speaker.
+        # Speaker change is a strong exogenous signal — we trust it, so no artificial hold-back.
+        speaker_switched = (
+            active_speaker and track_to_speaker and
+            current_subject_id in track_to_speaker and
+            track_to_speaker[current_subject_id] != active_speaker
+        )
+        effective_margin = 0.0 if speaker_switched else HYSTERESIS_MARGIN
+
         if best_id != current_subject_id:
-            # Check if new subject actually beats current with required margin
-            score_beats_current = (best_score > current_subject_score + HYSTERESIS_MARGIN)
+            # Compare BASE scores (no continuity) so continuity bonus doesn't block speaker switches
+            score_beats_current = best_base_score > current_det_base_score + effective_margin
 
             if score_beats_current:
                 if best_id == candidate_id:
@@ -280,7 +316,7 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h,
 
                 if candidate_frames >= hysteresis_frames:
                     current_subject_id = best_id
-                    current_subject_score = best_score
+                    current_base_score = best_base_score
                     active_alpha = LERP_ALPHA_SWITCH  # faster transition for subject switch
             else:
                 # New subject doesn't beat current by margin → keep current
@@ -295,7 +331,7 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h,
         else:
             candidate_id = -1
             candidate_frames = 0
-            current_subject_score = best_score  # update score for current subject
+            current_base_score = best_base_score  # refresh for next frame's comparison
             active_alpha = LERP_ALPHA
 
         # Rush 2: Track if active speaker is framed

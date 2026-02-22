@@ -15,6 +15,7 @@ import os
 import json
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -36,18 +37,46 @@ def extract_audio(video_path: str, audio_path: str) -> str:
     return audio_path
 
 
-def transcribe_whisper(audio_path: str, language: str = "fr") -> dict:
-    """Call OpenAI Whisper API with word-level timestamps."""
-    client = OpenAI()
+def transcribe_whisper(audio_path: str, language: str = "fr", max_retries: int = 3) -> dict:
+    """Call OpenAI Whisper API with word-level timestamps.
 
-    with open(audio_path, "rb") as f:
-        response = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            language=language,
-            response_format="verbose_json",
-            timestamp_granularities=["word", "segment"],
+    CRITICAL FIX #2: retry logic (3x, exponential backoff 1s/2s/4s) on 429/5xx,
+    file size check before upload (Whisper limit: 25 MB).
+    """
+    # Check file size before sending — Whisper API hard limit is 25 MB
+    size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+    if size_mb > 24.9:
+        raise ValueError(
+            f"Audio file too large for Whisper API: {size_mb:.1f} MB (limit ~25 MB). "
+            "Split the file or reduce audio quality."
         )
+
+    client = OpenAI()
+    last_exc = None
+
+    for attempt in range(max_retries):
+        try:
+            with open(audio_path, "rb") as f:
+                response = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language=language,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                )
+            break  # success — exit retry loop
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                print(f"  ⚠️  Whisper API error (attempt {attempt + 1}/{max_retries}), "
+                      f"retry in {wait}s: {e}")
+                time.sleep(wait)
+            else:
+                raise RuntimeError(
+                    f"Whisper API failed after {max_retries} attempts. "
+                    f"Last error: {e}"
+                ) from e
 
     # Convert to our standard format
     result = {
@@ -101,7 +130,9 @@ def main():
     tmp_audio = None
 
     if ext in (".mp4", ".mkv", ".webm", ".mov", ".avi"):
-        tmp_audio = tempfile.mktemp(suffix=".mp3", prefix="whisper_")
+        # MEDIUM FIX #4: NamedTemporaryFile replaces deprecated mktemp() (TOCTOU race condition)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", prefix="whisper_", delete=False) as _f:
+            tmp_audio = _f.name
         print("  Extracting audio...")
         audio_path = extract_audio(input_path, tmp_audio)
 
