@@ -35,7 +35,7 @@ AUDIO_BITRATE = "128k"
 W_SIZE = 0.4
 W_CENTER = 0.2
 W_CONTINUITY = 0.3
-W_UNUSED = 0.1  # reserved for future speaker score
+# W_UNUSED = 0.1  # reserved for Rush 2 speaker score (score max = 0.9 until then)
 
 # Smooth crop
 LERP_ALPHA = 0.06          # exponential smoothing factor
@@ -44,7 +44,7 @@ MAX_MOVE_FRAC = 0.05       # max 5% of source width per frame
 
 # Hysteresis
 HYSTERESIS_MARGIN = 0.15   # new subject must beat current by this margin
-HYSTERESIS_FRAMES_1S = None  # computed from fps
+HYSTERESIS_SECONDS = 1.0   # minimum duration before switching subject (used inline as fps * 1.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -55,10 +55,19 @@ def detect_persons_pass(video_path: str):
     model = YOLO("yolov8n.pt")
 
     cap = cv2.VideoCapture(video_path)
+
+    # FIX #6 / HIGH #6 — Validate video opened + has frames
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if total_frames == 0:
+        cap.release()
+        raise RuntimeError(f"Video has 0 frames: {video_path}")
 
     print(f"  Source: {src_w}x{src_h}, {fps:.1f}fps, {total_frames} frames ({total_frames/fps:.1f}s)")
 
@@ -73,8 +82,18 @@ def detect_persons_pass(video_path: str):
             break
 
         if frame_idx % SAMPLE_EVERY == 0:
-            results = model.track(frame, persist=True, tracker="bytetrack.yaml",
-                                  classes=[0], conf=0.3, verbose=False)
+            # FIX #6 / HIGH #5 — Better bytetrack.yaml error handling
+            try:
+                results = model.track(frame, persist=True, tracker="bytetrack.yaml",
+                                      classes=[0], conf=0.3, verbose=False)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "bytetrack" in err_str or "yaml" in err_str:
+                    raise RuntimeError(
+                        "bytetrack.yaml introuvable. Réinstaller: pip install ultralytics"
+                    ) from e
+                raise
+
             dets = []
             if results and results[0].boxes is not None and len(results[0].boxes) > 0:
                 boxes = results[0].boxes
@@ -110,10 +129,11 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
     crop_h = src_h
 
     total_frames = len(all_detections)
-    hysteresis_frames = int(fps * 1.0)  # 1 second
+    hysteresis_frames = int(fps * HYSTERESIS_SECONDS)  # 1 second
     max_move_px = int(src_w * MAX_MOVE_FRAC)
 
     current_subject_id = -1
+    current_subject_score = 0.0   # FIX #7 — track current subject's score for margin check
     candidate_id = -1
     candidate_frames = 0
 
@@ -131,9 +151,16 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
         frame_area = src_w * src_h
 
         if not dets:
-            # Fallback: hold position, drift to center slowly
-            target_x = crop_x  # hold
+            # FIX #4 — Drift toward center slowly (don't freeze, don't skip LERP)
+            center_x = float((src_w - crop_w) / 2)
+            drift_alpha = 0.02  # very slow drift, no visible jump
+            prev_crop_x = crop_x
+            crop_x = crop_x + drift_alpha * (center_x - crop_x)
+            crop_x = max(0.0, min(crop_x, float(src_w - crop_w)))
             crop_positions.append(int(round(crop_x)))
+            if i > 0:
+                move = abs(crop_positions[-1] - crop_positions[-2])
+                moves.append(move)
             continue
 
         frames_with_person += 1
@@ -163,17 +190,28 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
                 best_id = d['track_id']
                 best_cx = cx
 
-        # Hysteresis: don't switch unless new subject is consistently better
+        # FIX #7 — Hysteresis with margin: only switch if new_score > current_score + HYSTERESIS_MARGIN
+        # and new subject has been consistently better for HYSTERESIS_SECONDS
         if best_id != current_subject_id:
-            if best_id == candidate_id:
-                candidate_frames += 1
-            else:
-                candidate_id = best_id
-                candidate_frames = 1
+            # Check if new subject actually beats current with required margin
+            score_beats_current = (best_score > current_subject_score + HYSTERESIS_MARGIN)
 
-            if candidate_frames >= hysteresis_frames:
-                current_subject_id = best_id
-                active_alpha = LERP_ALPHA_SWITCH  # faster transition for subject switch
+            if score_beats_current:
+                if best_id == candidate_id:
+                    candidate_frames += 1
+                else:
+                    candidate_id = best_id
+                    candidate_frames = 1
+
+                if candidate_frames >= hysteresis_frames:
+                    current_subject_id = best_id
+                    current_subject_score = best_score
+                    active_alpha = LERP_ALPHA_SWITCH  # faster transition for subject switch
+            else:
+                # New subject doesn't beat current by margin → keep current
+                candidate_id = -1
+                candidate_frames = 0
+
             # Use current subject's position if not switching yet
             for d in dets:
                 if d['track_id'] == current_subject_id:
@@ -182,6 +220,7 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
         else:
             candidate_id = -1
             candidate_frames = 0
+            current_subject_score = best_score  # update score for current subject
             active_alpha = LERP_ALPHA
 
         # Target: center the subject
@@ -219,33 +258,57 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
 # 3. Render cropped video
 # ──────────────────────────────────────────────────────────────────────────────
 def render_cropped(video_path, crop_positions, crop_w, crop_h, fps, tmp_video):
-    """Read source, crop per frame, write to tmp file."""
+    """Read source, crop per frame, pipe directly to ffmpeg (H.264 lossless).
+
+    FIX #5 — Replaces OpenCV mp4v writer to avoid double lossy encoding.
+    Frames are piped as raw BGR24 → ffmpeg encodes to H.264 CRF 0 (lossless).
+    """
     cap = cv2.VideoCapture(video_path)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(tmp_video, fourcc, fps, (OUT_W, OUT_H))
+
+    # FIX #5 — Pipe raw frames directly to ffmpeg (no intermediate lossy encode)
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{OUT_W}x{OUT_H}",
+        "-pix_fmt", "bgr24",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        tmp_video
+    ]
+    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     frame_idx = 0
     written = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        if frame_idx < len(crop_positions):
-            cx = crop_positions[frame_idx]
-        else:
-            cx = crop_positions[-1] if crop_positions else 0
+            if frame_idx < len(crop_positions):
+                cx = crop_positions[frame_idx]
+            else:
+                cx = crop_positions[-1] if crop_positions else 0
 
-        cx = max(0, min(cx, frame.shape[1] - crop_w))
-        cropped = frame[0:crop_h, cx:cx + crop_w]
-        resized = cv2.resize(cropped, (OUT_W, OUT_H), interpolation=cv2.INTER_LANCZOS4)
-        writer.write(resized)
-        written += 1
-        frame_idx += 1
+            cx = max(0, min(cx, frame.shape[1] - crop_w))
+            cropped = frame[0:crop_h, cx:cx + crop_w]
+            resized = cv2.resize(cropped, (OUT_W, OUT_H), interpolation=cv2.INTER_LANCZOS4)
+            proc.stdin.write(resized.tobytes())
+            written += 1
+            frame_idx += 1
+    finally:
+        cap.release()
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait()
 
-    cap.release()
-    writer.release()
+    if proc.returncode != 0:
+        raise RuntimeError("FFmpeg pipe encoding failed in render_cropped")
+
     print(f"  Wrote {written} cropped frames")
     return written
 
@@ -253,7 +316,7 @@ def render_cropped(video_path, crop_positions, crop_w, crop_h, fps, tmp_video):
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. Silence detection & cutting (from reframe_v2)
 # ──────────────────────────────────────────────────────────────────────────────
-def detect_silences(video_path):
+def detect_silences(video_path, total_duration=None):
     cmd = [
         "ffmpeg", "-i", video_path, "-af",
         f"silencedetect=noise=-30dB:d={SILENCE_THRESHOLD}",
@@ -265,6 +328,13 @@ def detect_silences(video_path):
     silences = []
     starts = re.findall(r"silence_start: ([\d.]+)", stderr)
     ends = re.findall(r"silence_end: ([\d.]+)", stderr)
+
+    # FIX MEDIUM #10 — Handle trailing silence (video ends during silence)
+    if len(starts) != len(ends):
+        print(f"  ⚠️  silence: {len(starts)} starts, {len(ends)} ends — trailing silence detected")
+        if len(starts) > len(ends) and total_duration is not None:
+            ends.append(str(total_duration))
+
     for s, e in zip(starts, ends):
         silences.append((float(s), float(e)))
 
@@ -369,44 +439,84 @@ def main():
 
     print(f"=== Smart Reframe v3 (YOLO + ByteTrack): {input_video} → {output_video} ===\n")
 
-    # Step 1: Person detection + tracking
-    print("[1/4] Running YOLOv8n person detection + ByteTrack tracking...")
-    all_detections, fps, total_frames, src_w, src_h = detect_persons_pass(input_video)
+    # Get source fps for CFR normalization
+    cap_info = cv2.VideoCapture(input_video)
+    if not cap_info.isOpened():
+        print(f"❌ Cannot open video: {input_video}")
+        sys.exit(1)
+    fps = cap_info.get(cv2.CAP_PROP_FPS)
+    cap_info.release()
 
-    # Step 2: Subject selection + smooth crop
-    print("\n[2/4] Computing subject selection + smooth crop...")
-    crop_positions, crop_w, crop_h, stats = compute_smooth_crop(
-        all_detections, fps, src_w, src_h
-    )
-    print(f"  Persons detected in {stats['frames_with_person']}/{stats['total_frames']} frames "
-          f"({stats['pct_person']:.1f}%)")
-    print(f"  Crop: {crop_w}x{crop_h}")
-    print(f"  Avg move/frame: {stats['avg_move']:.1f}px | Max jump: {stats['max_jump']}px")
-
-    # Step 3: Render cropped video
-    print("\n[3/4] Rendering cropped video...")
+    # FIX #1 — Wrap all temp file usage in try/finally to guarantee cleanup
     tmp_dir = tempfile.mkdtemp(prefix="reframe_v3_")
+    cfr_video = os.path.join(tmp_dir, "cfr_source.mp4")
     tmp_video = os.path.join(tmp_dir, "cropped.mp4")
-    render_cropped(input_video, crop_positions, crop_w, crop_h, fps, tmp_video)
 
-    # Step 4: Silence detection + final encode
-    print("\n[4/4] Detecting silences & final encode...")
-    total_duration = get_duration(input_video)
-    silences = detect_silences(input_video)
-    keep_segments = build_silence_cut_filter(silences, total_duration)
+    try:
+        # FIX #2 — Normalize VFR → CFR before any processing
+        # This ensures silence timestamps (computed on cfr_video) match the
+        # render output (also at constant fps). Prevents A/V desync on YT videos.
+        print("[0/4] Normalizing VFR → CFR source...")
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", input_video,
+            "-vf", f"fps={fps}", "-vsync", "cfr",
+            "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast",
+            "-c:a", "copy",
+            cfr_video
+        ], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  ⚠️  CFR normalization failed, using original (VFR desync risk):\n{result.stderr[-300:]}")
+            cfr_video = input_video  # fallback
+        else:
+            print(f"  CFR source: {cfr_video}")
 
-    if keep_segments:
-        kept_dur = sum(e - s for s, e in keep_segments)
-        print(f"  {total_duration:.1f}s → {kept_dur:.1f}s (cut {total_duration - kept_dur:.1f}s)")
-    else:
-        print("  No significant silences")
+        # Step 1: Person detection + tracking (on CFR video)
+        print("[1/4] Running YOLOv8n person detection + ByteTrack tracking...")
+        all_detections, fps, total_frames, src_w, src_h = detect_persons_pass(cfr_video)
 
-    print("  Encoding final output...")
-    final_encode(tmp_video, input_video, output_video, keep_segments)
+        # Step 2: Subject selection + smooth crop
+        print("\n[2/4] Computing subject selection + smooth crop...")
+        crop_positions, crop_w, crop_h, stats = compute_smooth_crop(
+            all_detections, fps, src_w, src_h
+        )
+        print(f"  Persons detected in {stats['frames_with_person']}/{stats['total_frames']} frames "
+              f"({stats['pct_person']:.1f}%)")
+        print(f"  Crop: {crop_w}x{crop_h}")
+        print(f"  Avg move/frame: {stats['avg_move']:.1f}px | Max jump: {stats['max_jump']}px")
 
-    # Cleanup
-    os.remove(tmp_video)
-    os.rmdir(tmp_dir)
+        # Step 3: Render cropped video (from CFR source, pipe to lossless H.264)
+        print("\n[3/4] Rendering cropped video...")
+        render_cropped(cfr_video, crop_positions, crop_w, crop_h, fps, tmp_video)
+
+        # Step 4: Silence detection + final encode (on CFR video for timestamp consistency)
+        print("\n[4/4] Detecting silences & final encode...")
+        total_duration = get_duration(cfr_video)
+        silences = detect_silences(cfr_video, total_duration=total_duration)
+        keep_segments = build_silence_cut_filter(silences, total_duration)
+
+        if keep_segments:
+            kept_dur = sum(e - s for s, e in keep_segments)
+            print(f"  {total_duration:.1f}s → {kept_dur:.1f}s (cut {total_duration - kept_dur:.1f}s)")
+        else:
+            print("  No significant silences")
+
+        print("  Encoding final output...")
+        # Audio source = cfr_video (has audio copy from original at same timestamps)
+        final_encode(tmp_video, cfr_video, output_video, keep_segments)
+
+    finally:
+        # FIX #1 — Guaranteed cleanup even if ffmpeg / YOLO crash
+        for f in [tmp_video, cfr_video]:
+            if f != input_video and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+        if os.path.exists(tmp_dir):
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass  # non-empty dir (extra debug files) — don't crash on cleanup
 
     # Report
     out_duration = get_duration(output_video)

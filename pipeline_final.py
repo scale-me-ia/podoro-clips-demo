@@ -38,10 +38,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ──────────────────────────────────────────────────────────────────────────────
 
 REFRAME_SCRIPT = os.path.join(os.path.dirname(__file__), "scripts", "reframe_v3.py")
-REFRAME_SCRIPT_V2 = os.path.join(os.path.dirname(__file__), "scripts", "reframe_v2.py")
 SUBTITLES_SCRIPT = os.path.join(os.path.dirname(__file__), "scripts", "subtitles.py")
 
-# Fallback: reframe_v2 if YOLO not available
+# Fallback: reframe_v2 if YOLO (ultralytics) not available
+# NOTE: REFRAME_SCRIPT_V2 removed — was identical duplicate of REFRAME_FALLBACK (MEDIUM #11)
 REFRAME_FALLBACK = os.path.join(os.path.dirname(__file__), "scripts", "reframe_v2.py")
 SUBTITLES_FALLBACK = "/tmp/podoro-clips-v3/agent-subtitles/subtitles.py"
 
@@ -417,6 +417,18 @@ def find_script(name: str, fallback: str) -> str:
     raise FileNotFoundError(f"Script not found: {name} (tried {local} and {fallback})")
 
 
+def is_yolo_available() -> bool:
+    """FIX #3 — Check if ultralytics (YOLO) is importable, not just if the script file exists.
+    The old check (os.path.exists(REFRAME_SCRIPT)) always returned True since the script
+    is always in the repo, causing silent failures when ultralytics is not installed.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", "from ultralytics import YOLO"],
+        capture_output=True
+    )
+    return result.returncode == 0
+
+
 def produce_clip(highlight: dict, video_path: str, vtt_path: str, out_dir: str, clip_num: int) -> str | None:
     """Extract → reframe B2 → subtitles C1 for one highlight."""
     start_s = highlight["start_s"]
@@ -445,11 +457,13 @@ def produce_clip(highlight: dict, video_path: str, vtt_path: str, out_dir: str, 
     ], check=True, capture_output=True)
 
     # 2. Reframe (YOLO v3, fallback to MediaPipe v2)
-    print(f"  [clip {clip_num}] Reframing (YOLO v3)...")
-    if os.path.exists(REFRAME_SCRIPT):
+    # FIX #3 — Check ultralytics import, not just script file existence.
+    # reframe_v3.py is always in the repo; the real gating factor is ultralytics.
+    if os.path.exists(REFRAME_SCRIPT) and is_yolo_available():
+        print(f"  [clip {clip_num}] Reframing (YOLO v3)...")
         reframe_script = REFRAME_SCRIPT
     else:
-        print(f"  [clip {clip_num}] ⚠️  v3 not found, falling back to v2")
+        print(f"  [clip {clip_num}] ⚠️  ultralytics not installed, falling back to v2")
         reframe_script = find_script("reframe_v2.py", REFRAME_FALLBACK)
     result = subprocess.run(
         [sys.executable, reframe_script, raw_path, b2_path],
