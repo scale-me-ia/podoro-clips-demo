@@ -35,7 +35,7 @@ AUDIO_BITRATE = "128k"
 W_SIZE = 0.4
 W_CENTER = 0.2
 W_CONTINUITY = 0.3
-# W_UNUSED = 0.1  # reserved for Rush 2 speaker score (score max = 0.9 until then)
+W_SPEAKER = 0.4  # Rush 2: bonus for active speaker (added on top, not normalized)
 
 # Smooth crop
 LERP_ALPHA = 0.06          # exponential smoothing factor
@@ -120,9 +120,70 @@ def detect_persons_pass(video_path: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 1b. Diarization: load + map track_id ↔ speaker_label
+# ──────────────────────────────────────────────────────────────────────────────
+def load_diarization(json_path: str) -> list:
+    """Load diarization segments: [{"start": float, "end": float, "speaker": str}, ...]"""
+    with open(json_path) as f:
+        return json.load(f)
+
+
+def get_active_speaker(diarization: list, time_s: float) -> str | None:
+    """Return the speaker label active at time_s, or None."""
+    for seg in diarization:
+        if seg["start"] <= time_s <= seg["end"]:
+            return seg["speaker"]
+    return None
+
+
+def build_track_speaker_map(all_detections, diarization, fps):
+    """Phase 1: Map track_id → speaker_label using single-person frames.
+
+    When only 1 person is detected in a frame AND diarization says someone is speaking,
+    that person IS the speaker. Accumulate votes and assign by majority.
+    """
+    # track_id → {speaker_label: count}
+    votes = {}
+
+    for frame_idx, dets in enumerate(all_detections):
+        if len(dets) != 1:
+            continue  # only use single-person frames for mapping
+
+        t = frame_idx / fps
+        speaker = get_active_speaker(diarization, t)
+        if not speaker:
+            continue
+
+        track_id = dets[0]['track_id']
+        if track_id < 0:
+            continue
+
+        if track_id not in votes:
+            votes[track_id] = {}
+        votes[track_id][speaker] = votes[track_id].get(speaker, 0) + 1
+
+    # Assign each track_id to its majority speaker
+    track_to_speaker = {}
+    for tid, speaker_counts in votes.items():
+        best_speaker = max(speaker_counts, key=speaker_counts.get)
+        total_votes = sum(speaker_counts.values())
+        confidence = speaker_counts[best_speaker] / total_votes
+        track_to_speaker[tid] = best_speaker
+        print(f"  Track {tid} → {best_speaker} (confidence {confidence:.0%}, {total_votes} votes)")
+
+    # Also build reverse map: speaker → list of track_ids
+    speaker_to_tracks = {}
+    for tid, spk in track_to_speaker.items():
+        speaker_to_tracks.setdefault(spk, []).append(tid)
+
+    return track_to_speaker, speaker_to_tracks
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 2. Subject Selection + Smooth Crop
 # ──────────────────────────────────────────────────────────────────────────────
-def compute_smooth_crop(all_detections, fps, src_w, src_h):
+def compute_smooth_crop(all_detections, fps, src_w, src_h,
+                        diarization=None, track_to_speaker=None):
     """Select subject per frame, compute smoothed crop_x."""
     crop_w = int(src_h * (9 / 16))
     crop_w = min(crop_w, src_w)
@@ -144,11 +205,13 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
 
     # Stats
     frames_with_person = 0
+    frames_speaker_framed = 0  # Rush 2: count frames where active speaker is the selected subject
     moves = []
 
     for i in range(total_frames):
         dets = all_detections[i]
         frame_area = src_w * src_h
+        t = i / fps  # current time in seconds
 
         if not dets:
             # FIX #4 — Drift toward center slowly (don't freeze, don't skip LERP)
@@ -164,6 +227,11 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
             continue
 
         frames_with_person += 1
+
+        # Get active speaker for this frame (if diarization available)
+        active_speaker = None
+        if diarization:
+            active_speaker = get_active_speaker(diarization, t)
 
         # Score each detection
         best_id = -1
@@ -181,9 +249,16 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
             center_score = 1.0 - abs(cx - src_w / 2) / (src_w / 2)
             continuity_score = 1.0 if d['track_id'] == current_subject_id else 0.0
 
+            # Rush 2: Speaker bonus
+            speaker_score = 0.0
+            if active_speaker and track_to_speaker and d['track_id'] in track_to_speaker:
+                if track_to_speaker[d['track_id']] == active_speaker:
+                    speaker_score = 1.0
+
             total = (size_score * W_SIZE +
                      center_score * W_CENTER +
-                     continuity_score * W_CONTINUITY)
+                     continuity_score * W_CONTINUITY +
+                     speaker_score * W_SPEAKER)
 
             if total > best_score:
                 best_score = total
@@ -223,6 +298,11 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
             current_subject_score = best_score  # update score for current subject
             active_alpha = LERP_ALPHA
 
+        # Rush 2: Track if active speaker is framed
+        if active_speaker and track_to_speaker and current_subject_id in track_to_speaker:
+            if track_to_speaker[current_subject_id] == active_speaker:
+                frames_speaker_framed += 1
+
         # Target: center the subject
         target_x = best_cx - crop_w / 2
         target_x = max(0, min(target_x, src_w - crop_w))
@@ -243,12 +323,22 @@ def compute_smooth_crop(all_detections, fps, src_w, src_h):
             move = abs(crop_positions[-1] - crop_positions[-2])
             moves.append(move)
 
+    # Count frames where diarization says someone is speaking
+    frames_with_speech = 0
+    if diarization:
+        for fi in range(total_frames):
+            if get_active_speaker(diarization, fi / fps):
+                frames_with_speech += 1
+
     stats = {
         'frames_with_person': frames_with_person,
         'total_frames': total_frames,
         'pct_person': 100 * frames_with_person / max(total_frames, 1),
         'avg_move': np.mean(moves) if moves else 0,
         'max_jump': max(moves) if moves else 0,
+        'frames_speaker_framed': frames_speaker_framed,
+        'frames_with_speech': frames_with_speech,
+        'pct_speaker_framed': 100 * frames_speaker_framed / max(frames_with_speech, 1) if diarization else None,
     }
 
     return crop_positions, crop_w, crop_h, stats
@@ -429,15 +519,27 @@ def final_encode(tmp_video, audio_source, output_path, keep_segments):
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
+def parse_args():
+    """Parse CLI arguments."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Smart Reframe v3: 16:9 → 9:16 with YOLO + ByteTrack")
+    parser.add_argument("input", help="Input video (16:9)")
+    parser.add_argument("output", help="Output video (9:16)")
+    parser.add_argument("--diarization", help="Diarization JSON file (speaker segments)", default=None)
+    parser.add_argument("--no-silence-cut", action="store_true", help="Skip silence cutting")
+    return parser.parse_args()
+
+
 def main():
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <input.mp4> <output.mp4>")
-        sys.exit(1)
+    args = parse_args()
+    input_video = args.input
+    output_video = args.output
+    diarization_path = args.diarization
 
-    input_video = sys.argv[1]
-    output_video = sys.argv[2]
-
-    print(f"=== Smart Reframe v3 (YOLO + ByteTrack): {input_video} → {output_video} ===\n")
+    print(f"=== Smart Reframe v3 (YOLO + ByteTrack): {input_video} → {output_video} ===")
+    if diarization_path:
+        print(f"  Speaker diarization: {diarization_path}")
+    print()
 
     # Get source fps for CFR normalization
     cap_info = cv2.VideoCapture(input_video)
@@ -474,10 +576,26 @@ def main():
         print("[1/4] Running YOLOv8n person detection + ByteTrack tracking...")
         all_detections, fps, total_frames, src_w, src_h = detect_persons_pass(cfr_video)
 
+        # Step 1b: Load diarization + build track↔speaker map (if provided)
+        diarization = None
+        track_to_speaker = None
+        if diarization_path:
+            print("\n[1b/4] Loading diarization & mapping tracks → speakers...")
+            diarization = load_diarization(diarization_path)
+            speakers = set(s["speaker"] for s in diarization)
+            print(f"  {len(diarization)} segments, {len(speakers)} speakers: {', '.join(sorted(speakers))}")
+            track_to_speaker, speaker_to_tracks = build_track_speaker_map(
+                all_detections, diarization, fps
+            )
+            if not track_to_speaker:
+                print("  ⚠️  No track↔speaker mapping found (not enough single-person frames)")
+                print("  Falling back to size+center+continuity scoring")
+
         # Step 2: Subject selection + smooth crop
         print("\n[2/4] Computing subject selection + smooth crop...")
         crop_positions, crop_w, crop_h, stats = compute_smooth_crop(
-            all_detections, fps, src_w, src_h
+            all_detections, fps, src_w, src_h,
+            diarization=diarization, track_to_speaker=track_to_speaker,
         )
         print(f"  Persons detected in {stats['frames_with_person']}/{stats['total_frames']} frames "
               f"({stats['pct_person']:.1f}%)")
@@ -491,8 +609,12 @@ def main():
         # Step 4: Silence detection + final encode (on CFR video for timestamp consistency)
         print("\n[4/4] Detecting silences & final encode...")
         total_duration = get_duration(cfr_video)
-        silences = detect_silences(cfr_video, total_duration=total_duration)
-        keep_segments = build_silence_cut_filter(silences, total_duration)
+        keep_segments = None
+        if not args.no_silence_cut:
+            silences = detect_silences(cfr_video, total_duration=total_duration)
+            keep_segments = build_silence_cut_filter(silences, total_duration)
+        else:
+            print("  Silence cutting disabled")
 
         if keep_segments:
             kept_dur = sum(e - s for s, e in keep_segments)
@@ -529,6 +651,8 @@ def main():
     print(f"Person detected: {stats['pct_person']:.1f}% of frames")
     print(f"Avg move/frame: {stats['avg_move']:.1f}px")
     print(f"Max jump: {stats['max_jump']}px")
+    if stats.get('pct_speaker_framed') is not None:
+        print(f"Speaker framed: {stats['pct_speaker_framed']:.1f}% of speech frames")
 
     return stats
 
