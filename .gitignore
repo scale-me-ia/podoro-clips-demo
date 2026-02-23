@@ -25,3 +25,4 @@ results/
 
 # Demo clips (force-tracked)
 !demo/*.mp4
+!demo/**/*.mp4
