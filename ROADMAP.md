@@ -232,21 +232,147 @@ python pipeline_v2.py --video ./podcast.mp4 --out ./output/
   - LinkedIn (optionnel)
 - [ ] Schedule : post les clips à des heures optimales (pas tous d'un coup)
 
-### T5.3 — UI clips dans Podoro
-- [ ] Page `/clips` dans l'app Podoro (existe déjà partiellement)
-- [ ] Afficher les clips générés pour chaque épisode
-- [ ] Player vertical intégré
-- [ ] Boutons de partage
+### T5.3 — ✅ DONE (Neo, 23/02)
+- Backend infra fait : trigger Postgres, LaunchAgent clip_worker, Edge Functions
+- Reste : UI + distribution (voir Rush 6)
 
 ### T5.4 — QA Rush 5
-- [ ] Test E2E : nouvel épisode → pipeline → clips stockés → affichés dans l'app
-- [ ] Test distribution sur un réseau
+- [ ] Test E2E : nouvel épisode → pipeline → clips stockés
 - [ ] Push sur GitHub
 
 **Critères de validation Rush 5** :
 - ✅ Pipeline automatique : épisode publié → clips générés
-- ✅ Clips visibles dans l'app Podoro
-- ✅ Distribution sur au moins 1 réseau social
+- ✅ Clips stockés dans Supabase Storage
+
+---
+
+## 🟣 Rush 6 — Dashboard Admin Clips sur podoro.fr (2-3h)
+**Objectif** : Page `/admin/clips` dans l'app Podoro (https://podoro.fr/admin) pour tracker et gérer tous les clips générés.
+**Workspace frontend** : `/Users/OpenClaw/.openclaw/workspace-anthropic/Capsule/web-app/`
+
+### T6.1 — Page `/admin/clips`
+- [ ] Route `/admin/clips` dans le router existant
+- [ ] Vue tableau/grille de tous les clips avec :
+  - Thumbnail preview
+  - Titre de l'épisode source
+  - Score du clip
+  - Hook text
+  - Durée
+  - Statut (pending → processing → ready → distributed → error)
+  - Date de création
+- [ ] Filtres : par épisode, par statut, par score
+- [ ] Tri : par date, score, statut
+
+### T6.2 — Player & Actions
+- [ ] Player vertical intégré (click sur un clip → modal avec preview 9:16)
+- [ ] Boutons d'action par clip :
+  - ▶️ Preview
+  - 📥 Download
+  - 🗑️ Supprimer
+  - 🔄 Relancer la génération
+  - 📤 Distribuer manuellement (choix réseau)
+- [ ] Bulk actions : distribuer / supprimer plusieurs clips
+
+### T6.3 — Stats overview
+- [ ] Compteurs en haut de page : total clips, en attente, distribués, erreurs
+- [ ] Graphique clips générés par semaine (optionnel)
+
+### T6.4 — QA Rush 6
+- [ ] Page accessible et fonctionnelle sur podoro.fr/admin
+- [ ] Player preview fonctionne
+- [ ] Actions CRUD opérationnelles
+- [ ] Responsive (desktop + mobile)
+- [ ] Push sur GitHub
+
+**Critères de validation Rush 6** :
+- ✅ Dashboard admin clips fonctionnel sur podoro.fr/admin
+- ✅ Preview, download, suppression, relance
+- ✅ Filtres et stats
+
+---
+
+## 🔵 Rush 7 — YouTube Video Scanner (2-3h)
+**Objectif** : Scanner automatiquement YouTube pour trouver les versions vidéo des derniers épisodes de podcasts suivis, et lancer le processus de clips.
+
+### T7.1 — Migration DB
+- [ ] Ajouter colonne `youtube_channel_id` (text, nullable) à la table `podcasts`
+- [ ] Ajouter colonne `youtube_url` (text, nullable) à la table `episodes`
+- [ ] Ajouter colonne `has_video` (boolean, default false) à la table `episodes`
+
+### T7.2 — Script/Edge Function `scan-youtube-videos`
+- [ ] Pour chaque podcast actif ayant un `youtube_channel_id` :
+  1. Utiliser `yt-dlp --flat-playlist` ou YouTube Data API v3 (search.list) pour lister les dernières vidéos de la chaîne
+  2. Matcher les vidéos avec les épisodes existants par titre (fuzzy match — les titres YouTube et RSS diffèrent souvent légèrement)
+  3. Si match trouvé → mettre à jour `episodes.youtube_url` et `has_video = true`
+  4. Si l'épisode est `published` et `has_video = true` et pas de clips existants → créer un run dans la table clips pour trigger le clip_worker
+- [ ] Scoring de matching : Levenshtein distance ou token overlap > 70%
+- [ ] Log les matches et les misses pour debug
+
+### T7.3 — Mapping initial des chaînes YouTube
+Podcasts actifs à mapper :
+| Podcast | YouTube probable |
+|---------|----------------|
+| Le Gratin | @legratin |
+| La Martingale | @LaMartingale |
+| Génération Do It Yourself | @GenerationDoItYourself |
+| Sans Permission | @SansPermission |
+| Marketing Mania | @MarketingMania |
+| Tribu Indé | @TribuInde |
+| Le Panier | @LePanier |
+| TheBBoost | @TheBBoost |
+| Serial Entrepreneurs | @serialentrepreneurs |
+| 2 Heures de Perdues | @2heuresdeperdues |
+| L'Envolée | à chercher |
+| Little Big Things | à chercher |
+
+- [ ] Script de résolution : pour chaque podcast, chercher la chaîne YouTube via `yt-dlp "ytsearch:{podcast_name} podcast"` et valider manuellement
+- [ ] Insérer les `youtube_channel_id` dans la table podcasts
+
+### T7.4 — Cron automatique
+- [ ] pg_cron ou cron OpenClaw : lancer `scan-youtube-videos` toutes les 6h
+- [ ] Ne scanner que les épisodes des 7 derniers jours (pas tout l'historique)
+- [ ] Rate limiting : max 50 requêtes YouTube par scan
+
+### T7.5 — UI dans /admin/clips
+- [ ] Ajouter un bouton "🔍 Scanner YouTube" dans le dashboard admin clips
+- [ ] Afficher un indicateur "📹 Vidéo dispo" sur les épisodes qui ont un `youtube_url`
+- [ ] Permettre de lancer manuellement la génération de clips depuis un épisode avec vidéo
+
+### T7.6 — QA Rush 7
+- [ ] Tester le scan sur 2-3 podcasts connus (Sans Permission, Marketing Mania)
+- [ ] Vérifier le matching titre
+- [ ] Vérifier que le clip_worker se lance automatiquement
+- [ ] Push sur GitHub
+
+**Critères de validation Rush 7** :
+- ✅ Scanner trouve les vidéos YouTube des épisodes récents
+- ✅ Matching titre > 80% de précision
+- ✅ Clips auto-générés pour les épisodes avec vidéo
+- ✅ Bouton scan manuel dans l'admin
+
+---
+
+## 🟤 Rush 8 — Distribution Réseaux Sociaux (2-3h)
+**Objectif** : Distribution automatique des clips sur les réseaux.
+
+### T7.1 — APIs réseaux sociaux
+- [ ] Instagram Reels (via Instagram Graph API)
+- [ ] TikTok (via TikTok Content Posting API)
+- [ ] Twitter/X (via Twitter API v2)
+- [ ] LinkedIn (optionnel)
+- [ ] Compléter l'Edge Function `distribute-clips` avec les vraies APIs
+
+### T7.2 — Scheduling
+- [ ] Post à des heures optimales (pas tous d'un coup)
+- [ ] File d'attente avec espacement configurable
+
+### T7.3 — QA Rush 7
+- [ ] Test distribution sur au moins 1 réseau
+- [ ] Vérifier que le statut se met à jour dans le dashboard admin
+
+**Critères de validation Rush 7** :
+- ✅ Distribution fonctionnelle sur au moins 1 réseau
+- ✅ Statut mis à jour dans le dashboard
 
 ---
 

@@ -26,3 +26,7 @@ results/
 # Demo clips (force-tracked)
 !demo/*.mp4
 !demo/**/*.mp4
+
+# Logs
+logs/*.log
+supabase/.temp/
