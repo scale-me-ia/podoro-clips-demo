@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.podoro.clip-worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/OpenClaw/.openclaw/workspace-podoro-clips/podoro-clips/clip_worker.py</string>
+        <string>--interval</string>
+        <string>60</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/podoro-clip-worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/podoro-clip-worker.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SUPABASE_URL</key>
+        <string>https://agypzrkevayucfvmawee.supabase.co</string>
+        <key>SUPABASE_SERVICE_ROLE_KEY</key>
+        <string>eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFneXB6cmtldmF5dWNmdm1hd2VlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTI0ODU5NSwiZXhwIjoyMDg2ODI0NTk1fQ.4RrzdjMAfwbef2dBT1U0P5Ny2soaLNtwG67sBxUeV9o</string>
+        <key>PIPELINE_SCRIPT</key>
+        <string>/Users/OpenClaw/.openclaw/workspace-podoro-clips/podoro-clips/pipeline_v2.py</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>
