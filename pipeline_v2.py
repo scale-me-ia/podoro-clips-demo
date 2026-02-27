@@ -234,7 +234,11 @@ def transcribe(video_path: str, out_dir: str, language: str = "fr") -> dict:
 
         response = with_retry(_call_whisper, retries=3, base_delay=2.0, label="whisper")
         # Track cost: audio length in minutes
-        COST_TRACKER["whisper_minutes"] += size_mb / 1.5  # rough estimate: ~1.5 MB/min
+        _whisper_duration = getattr(response, "duration", None)
+        if _whisper_duration:
+            COST_TRACKER["whisper_minutes"] += _whisper_duration / 60
+        else:
+            COST_TRACKER["whisper_minutes"] += size_mb / 1.5  # fallback estimate: ~1.5 MB/min
 
         result = {
             "text": response.text,
@@ -702,7 +706,7 @@ def add_subtitles(clip_path: str, whisper_data: dict, clip_start: float,
             "word": w["word"],
         }
         for w in words
-        if w["start"] >= clip_start - 0.5 and w["end"] <= clip_start + 9999
+        if w["start"] >= clip_start - 0.5 and w["end"] <= clip_end + 0.5
     ]
 
     # Also adjust segments
@@ -714,7 +718,7 @@ def add_subtitles(clip_path: str, whisper_data: dict, clip_start: float,
             "text": s["text"],
         }
         for s in segments
-        if s["start"] >= clip_start - 0.5
+        if s["start"] >= clip_start - 0.5 and s["end"] <= clip_end + 0.5
     ]
 
     clip_whisper = {
@@ -910,39 +914,42 @@ def parse_args():
     return p.parse_args()
 
 
+def _load_env_var_from_files(key: str) -> str | None:
+    """Try to load a key from .env (cwd first, then ~/.env)."""
+    candidates = [
+        Path(".env"),
+        Path(".env.local"),
+        Path.home() / ".env",
+    ]
+    for env_file in candidates:
+        if env_file.exists():
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith(f"{key}="):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
 def load_api_keys(args):
-    """Load API keys from args, env, or .env file."""
-    # Anthropic
+    """Load API keys from args, env vars, or .env files (cwd → ~/.env)."""
+    # Anthropic — order: CLI arg > env var > .env files
     anthropic_key = (
         args.anthropic_key
         or os.environ.get("ANTHROPIC_API_KEY")
+        or _load_env_var_from_files("ANTHROPIC_API_KEY")
     )
     if not anthropic_key:
-        env_file = "/Users/OpenClaw/.openclaw/workspace-anthropic/.env.anthropic"
-        if os.path.exists(env_file):
-            with open(env_file) as f:
-                for line in f:
-                    if line.startswith("ANTHROPIC_API_KEY="):
-                        anthropic_key = line.strip().split("=", 1)[1]
-                        break
-    if not anthropic_key:
         raise ValueError(
-            "ANTHROPIC_API_KEY not found. Set env var or use --anthropic-key"
+            "ANTHROPIC_API_KEY not found. Set env var, use --anthropic-key, or add to .env"
         )
 
     # OpenAI (Whisper) — only needed if transcription required
     openai_key = (
         args.openai_key
         or os.environ.get("OPENAI_API_KEY")
+        or _load_env_var_from_files("OPENAI_API_KEY")
     )
-    if not openai_key:
-        env_file = "/Users/OpenClaw/.openclaw/workspace-anthropic/.env.anthropic"
-        if os.path.exists(env_file):
-            with open(env_file) as f:
-                for line in f:
-                    if line.startswith("OPENAI_API_KEY="):
-                        openai_key = line.strip().split("=", 1)[1]
-                        break
     if openai_key:
         os.environ["OPENAI_API_KEY"] = openai_key
 
