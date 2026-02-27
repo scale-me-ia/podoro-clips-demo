@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """
-pipeline_v2.py — Podoro Clips Full E2E Pipeline v2
-====================================================
+pipeline_v2.py — Podoro Clips Full E2E Pipeline v2 (Rush 4)
+=============================================================
 Usage:
-    python3 pipeline_v2.py --url <youtube_url>               # Download + process
-    python3 pipeline_v2.py --video <local.mp4>               # Local file
-    python3 pipeline_v2.py --video <local.mp4> \\
-        --whisper-json <existing.json>                        # Skip transcription
-    python3 pipeline_v2.py --video <f.mp4> --dry-run         # Highlight detection only
+    python3 pipeline_v2.py --url "https://youtube.com/watch?v=..."
+    python3 pipeline_v2.py --video ./podcast.mp4 --out ./output/
+    python3 pipeline_v2.py --video ./podcast.mp4 --max-clips 5 --min-score 60
+    python3 pipeline_v2.py --video ./podcast.mp4 --skip-subtitles --no-diarization
 
 Options:
     --url URL              YouTube URL to download (requires yt-dlp)
-    --video PATH           Local video file
-    --whisper-json PATH    Pre-existing Whisper JSON (skip Step 2)
-    --out DIR              Output directory (default: ./output_v2)
+    --video PATH           Local video file (mp4/mkv/webm)
+    --whisper-json PATH    Pre-existing Whisper JSON (skip transcription step)
+    --out DIR              Output directory (default: ./output)
     --max-clips N          Maximum clips to produce (default: 3)
+    --min-score N          Minimum score 1-10 to include clip (default: 0)
     --language LANG        Whisper language code (default: fr)
     --dry-run              Detect highlights only, skip video processing
     --no-reframe           Skip reframing step (use raw clip)
     --no-subs              Skip subtitles step
+    --skip-subtitles       Alias for --no-subs
+    --no-diarization       Disable speaker diarization (default: already off; for compatibility)
+    --anthropic-key KEY    Anthropic API key
+    --openai-key KEY       OpenAI API key (Whisper)
 
 Pipeline:
     Step 1 — Download (yt-dlp) or use local file
@@ -27,6 +31,12 @@ Pipeline:
     Step 4 — Dynamic window expansion (min 45s, max 90s, complete arc)
     Step 5 — For each top clip: extract → reframe_v3.py → subtitles_v3.py
     Step 6 — Output JSON + summary
+
+Output: output/{podcast_name}/clip_{N}_{score}.mp4 + results.json
+
+Environment variables:
+    ANTHROPIC_API_KEY      Claude API key
+    OPENAI_API_KEY         OpenAI Whisper API key
 """
 
 import argparse
@@ -37,6 +47,49 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    class tqdm:  # noqa: F811
+        """Minimal tqdm stub when package is not installed."""
+        def __init__(self, iterable=None, **kwargs):
+            self._it = iterable
+            desc = kwargs.get("desc", "")
+            total = kwargs.get("total", "?")
+            if desc:
+                print(f"  [{desc}] (0/{total})")
+        def __iter__(self):
+            return iter(self._it or [])
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def update(self, n=1): pass
+        def set_postfix_str(self, s=""): pass
+        def set_description(self, s=""): pass
+        @staticmethod
+        def write(s): print(s)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Retry helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def with_retry(fn, *args, retries: int = 3, base_delay: float = 2.0, label: str = "", **kwargs):
+    """Call fn(*args, **kwargs) up to `retries` times with exponential backoff."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                wait = base_delay * (2 ** attempt)
+                tag = f"[{label}] " if label else ""
+                print(f"  ⚠️  {tag}Attempt {attempt+1}/{retries} failed: {e}. Retrying in {wait:.0f}s...")
+                time.sleep(wait)
+    raise last_exc
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -50,6 +103,25 @@ MIN_CLIP_DURATION = 45   # seconds
 MAX_CLIP_DURATION = 90   # seconds
 TARGET_CLIP_DURATION = 65  # ideal clip length
 DEFAULT_MAX_CLIPS = 3
+DEFAULT_MIN_SCORE = 0
+
+# Cost tracking (approximate)
+COST_TRACKER = {
+    "whisper_minutes": 0.0,
+    "claude_input_tokens": 0,
+    "claude_output_tokens": 0,
+}
+
+def estimate_cost() -> float:
+    """Estimate total API cost in USD."""
+    # Whisper: $0.006/minute
+    whisper_cost = COST_TRACKER["whisper_minutes"] * 0.006
+    # Claude Sonnet: $3/M input, $15/M output
+    claude_cost = (
+        COST_TRACKER["claude_input_tokens"] / 1_000_000 * 3.0
+        + COST_TRACKER["claude_output_tokens"] / 1_000_000 * 15.0
+    )
+    return round(whisper_cost + claude_cost, 4)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -150,24 +222,19 @@ def transcribe(video_path: str, out_dir: str, language: str = "fr") -> dict:
         client = OpenAI()
         print(f"  Calling Whisper API (language={language})...")
 
-        for attempt in range(3):
-            try:
-                with open(tmp_audio, "rb") as f:
-                    response = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=f,
-                        language=language,
-                        response_format="verbose_json",
-                        timestamp_granularities=["word", "segment"],
-                    )
-                break
-            except Exception as e:
-                if attempt < 2:
-                    wait = 2 ** attempt
-                    print(f"  ⚠️  Retry {attempt+1}/3 in {wait}s: {e}")
-                    time.sleep(wait)
-                else:
-                    raise
+        def _call_whisper():
+            with open(tmp_audio, "rb") as f:
+                return client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language=language,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                )
+
+        response = with_retry(_call_whisper, retries=3, base_delay=2.0, label="whisper")
+        # Track cost: audio length in minutes
+        COST_TRACKER["whisper_minutes"] += size_mb / 1.5  # rough estimate: ~1.5 MB/min
 
         result = {
             "text": response.text,
@@ -345,11 +412,15 @@ Important: utilise les timestamps exacts de la transcription (marqués [Xs]). Le
 
     try:
         print("  Calling Claude API...")
-        response = client.messages.create(
+        response = with_retry(
+            client.messages.create,
             model="claude-sonnet-4-20250514",
             max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            retries=3, base_delay=2.0, label="claude-highlights"
         )
+        COST_TRACKER["claude_input_tokens"] += getattr(response.usage, "input_tokens", 0)
+        COST_TRACKER["claude_output_tokens"] += getattr(response.usage, "output_tokens", 0)
 
         response_text = response.content[0].text.strip()
 
@@ -677,8 +748,10 @@ def add_subtitles(clip_path: str, whisper_data: dict, clip_start: float,
 
 
 def process_clip(clip_idx: int, clip: dict, video_path: str, whisper_data: dict,
-                 out_dir: str, no_reframe: bool = False, no_subs: bool = False) -> dict:
+                 out_dir: str, podcast_name: str = "podcast",
+                 no_reframe: bool = False, no_subs: bool = False) -> dict:
     """Full clip processing: extract → reframe → subtitles."""
+    score = clip.get("score", 0)
     clip_dir = os.path.join(out_dir, f"clip_{clip_idx+1:02d}")
     os.makedirs(clip_dir, exist_ok=True)
 
@@ -720,7 +793,10 @@ def process_clip(clip_idx: int, clip: dict, video_path: str, whisper_data: dict,
         return result
 
     # 3. Add subtitles
-    final_path = os.path.join(clip_dir, "final_clip.mp4")
+    # Final output: {out_dir}/{podcast_name}/clip_{N}_{score}.mp4
+    podcast_out_dir = os.path.join(out_dir, podcast_name)
+    os.makedirs(podcast_out_dir, exist_ok=True)
+    final_path = os.path.join(podcast_out_dir, f"clip_{clip_idx+1}_{score}.mp4")
     print(f"    [subtitles] → {final_path}")
     with tempfile.TemporaryDirectory(prefix="subs_v2_") as tmp_dir:
         try:
@@ -816,14 +892,19 @@ def parse_args():
     src.add_argument("--video", help="Local video file path")
 
     p.add_argument("--whisper-json", help="Pre-existing Whisper JSON (skip Step 2)")
-    p.add_argument("--out", default="./output_v2", help="Output directory (default: ./output_v2)")
+    p.add_argument("--out", default="./output", help="Output directory (default: ./output)")
     p.add_argument("--max-clips", type=int, default=DEFAULT_MAX_CLIPS,
                    help=f"Max clips to produce (default: {DEFAULT_MAX_CLIPS})")
+    p.add_argument("--min-score", type=int, default=DEFAULT_MIN_SCORE,
+                   help=f"Minimum viral score 1-10 (default: {DEFAULT_MIN_SCORE}, no filter)")
     p.add_argument("--language", default="fr", help="Whisper language (default: fr)")
     p.add_argument("--dry-run", action="store_true",
                    help="Detect highlights only, skip video processing")
     p.add_argument("--no-reframe", action="store_true", help="Skip reframing step")
     p.add_argument("--no-subs", action="store_true", help="Skip subtitles step")
+    p.add_argument("--skip-subtitles", action="store_true", help="Alias for --no-subs")
+    p.add_argument("--no-diarization", action="store_true",
+                   help="Disable speaker diarization (not used in this pipeline; for compatibility)")
     p.add_argument("--anthropic-key", help="Anthropic API key (default: ANTHROPIC_API_KEY env)")
     p.add_argument("--openai-key", help="OpenAI API key (default: OPENAI_API_KEY env)")
     return p.parse_args()
@@ -878,6 +959,13 @@ def main():
 
     t_start = time.time()
 
+    # Merge --skip-subtitles into --no-subs
+    if args.skip_subtitles:
+        args.no_subs = True
+
+    if args.no_diarization:
+        print("  ℹ️  --no-diarization: diarization is not used in this pipeline (no-op)")
+
     # Load API keys
     try:
         anthropic_key, openai_key = load_api_keys(args)
@@ -890,6 +978,12 @@ def main():
         video_path = download_youtube(args.url, args.out)
     else:
         video_path = validate_local_file(args.video)
+
+    # Derive podcast_name from video filename
+    podcast_name = Path(video_path).stem
+    # Sanitize: keep only alphanumeric, dashes, underscores
+    import re as _re
+    podcast_name = _re.sub(r'[^\w\-]', '_', podcast_name)[:50].strip('_') or "podcast"
 
     # ── Step 2: Transcription ─────────────────────────────────────────────────
     if args.whisper_json:
@@ -917,6 +1011,15 @@ def main():
     # ── Step 4: Window expansion ──────────────────────────────────────────────
     expanded = expand_all_windows(candidates, whisper_data)
 
+    # Filter by min-score
+    if args.min_score > 0:
+        before = len(expanded)
+        expanded = [c for c in expanded if c.get("score", 0) >= args.min_score]
+        print(f"  🔍 Min-score filter ({args.min_score}): {len(expanded)}/{before} clips kept")
+        if not expanded:
+            print(f"❌ No clips with score >= {args.min_score}")
+            sys.exit(1)
+
     # Take top N by score
     top_clips = expanded[:args.max_clips]
 
@@ -931,19 +1034,30 @@ def main():
     # ── Step 5: Process clips ─────────────────────────────────────────────────
     print(f"\n▶ Step 5/6: Processing {len(top_clips)} clip(s)...")
     final_clips = []
+    clips_ok = []
+    clips_failed = []
 
-    for i, clip in enumerate(top_clips):
-        try:
-            result = process_clip(
-                i, clip, video_path, whisper_data, args.out,
-                no_reframe=args.no_reframe,
-                no_subs=args.no_subs,
-            )
-            final_clips.append(result)
-        except Exception as e:
-            print(f"  ❌ Clip #{i+1} failed: {e}")
-            clip["error"] = str(e)
-            final_clips.append(clip)
+    with tqdm(total=len(top_clips), desc="clips", unit="clip") as pbar:
+        for i, clip in enumerate(top_clips):
+            pbar.set_description(f"Clip {i+1}/{len(top_clips)} [{clip['start']:.0f}s-{clip['end']:.0f}s]")
+            try:
+                result = process_clip(
+                    i, clip, video_path, whisper_data, args.out,
+                    podcast_name=podcast_name,
+                    no_reframe=args.no_reframe,
+                    no_subs=args.no_subs,
+                )
+                final_clips.append(result)
+                if result.get("final_path") and os.path.exists(result.get("final_path", "")):
+                    clips_ok.append(result)
+                else:
+                    clips_failed.append(result)
+            except Exception as e:
+                print(f"\n  ❌ Clip #{i+1} failed (continuing): {e}")
+                clip["error"] = str(e)
+                final_clips.append(clip)
+                clips_failed.append(clip)
+            pbar.update(1)
 
     # ── Step 6: Output ────────────────────────────────────────────────────────
     print(f"\n▶ Step 6/6: Results...")
@@ -951,8 +1065,27 @@ def main():
     results_path = save_results(final_clips, args.out)
 
     elapsed = time.time() - t_start
-    print(f"\n  ⏱️  Total time: {elapsed:.0f}s")
-    print(f"  📁 Output dir: {args.out}")
+    estimated_cost = estimate_cost()
+
+    print("\n" + "=" * 70)
+    print("  📊 FINAL SUMMARY")
+    print("=" * 70)
+    print(f"  ✅ Clips generated  : {len(clips_ok)}")
+    print(f"  ❌ Clips failed     : {len(clips_failed)}")
+    print(f"  ⏱️  Total time       : {elapsed:.0f}s ({elapsed/60:.1f} min)")
+    print(f"  💰 Estimated cost   : ~${estimated_cost:.4f} USD")
+    print(f"  📁 Output dir       : {args.out}/{podcast_name}/")
+    if clips_ok:
+        for c in clips_ok:
+            fp = c.get("final_path", "")
+            size = c.get("size_mb", 0)
+            dur = c.get("actual_duration", 0)
+            print(f"     📹 {os.path.basename(fp)} ({dur:.0f}s, {size:.1f} MB)")
+    if clips_failed:
+        print(f"\n  Failed clips:")
+        for c in clips_failed:
+            print(f"     ❌ Clip #{c.get('clip_index','?')}: {c.get('error', 'unknown error')}")
+    print("=" * 70)
 
     return final_clips
 

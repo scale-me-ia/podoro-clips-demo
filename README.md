@@ -185,7 +185,102 @@ Ensuite, décommenter les `switch` dans `distribute-clips/index.ts` et implémen
 
 ---
 
-## Pipeline principal
+## Pipeline CLI — pipeline_v2.py (Rush 4)
+
+Pipeline E2E standalone : YouTube URL ou fichier local → clips viraux 9:16 avec sous-titres.
+
+### Installation
+
+```bash
+# Dépendances Python
+pip install anthropic openai google-generativeai \
+    ultralytics supervision pillow tqdm yt-dlp ffmpeg-python
+
+# FFmpeg (macOS)
+brew install ffmpeg
+
+# Variables d'environnement
+export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-proj-...       # pour Whisper
+```
+
+### Usage
+
+```bash
+# Depuis une URL YouTube
+python3 pipeline_v2.py --url "https://youtube.com/watch?v=..." --out ./output/
+
+# Depuis un fichier local
+python3 pipeline_v2.py --video ./podcast.mp4 --out ./output/
+
+# Avec options avancées
+python3 pipeline_v2.py --video ./podcast.mp4 \
+    --max-clips 5 \
+    --min-score 7 \
+    --out ./output/ \
+    --language fr
+
+# Sans sous-titres (plus rapide)
+python3 pipeline_v2.py --video ./podcast.mp4 --skip-subtitles
+
+# Sans diarisation (compatible, déjà désactivée par défaut)
+python3 pipeline_v2.py --video ./podcast.mp4 --no-diarization
+
+# Dry-run : détection seulement, pas de rendu vidéo
+python3 pipeline_v2.py --video ./podcast.mp4 --dry-run
+
+# Avec transcription existante (skip Whisper)
+python3 pipeline_v2.py --video ./podcast.mp4 --whisper-json ./transcription.json
+```
+
+### Options complètes
+
+| Option | Défaut | Description |
+|--------|--------|-------------|
+| `--url URL` | — | URL YouTube à télécharger (yt-dlp) |
+| `--video PATH` | — | Fichier local (mp4/mkv/webm) |
+| `--out DIR` | `./output` | Répertoire de sortie |
+| `--max-clips N` | 3 | Nombre max de clips à générer |
+| `--min-score N` | 0 | Score minimum 1-10 pour inclure un clip |
+| `--language LANG` | `fr` | Langue Whisper |
+| `--dry-run` | — | Détection uniquement, pas de vidéo |
+| `--no-reframe` | — | Skip reframing (pas de conversion 9:16) |
+| `--no-subs` / `--skip-subtitles` | — | Skip sous-titres |
+| `--no-diarization` | — | Compatibilité (diarisation non utilisée) |
+| `--whisper-json PATH` | — | JSON Whisper existant (skip transcription) |
+| `--anthropic-key KEY` | `$ANTHROPIC_API_KEY` | Clé API Claude |
+| `--openai-key KEY` | `$OPENAI_API_KEY` | Clé API OpenAI (Whisper) |
+
+### Output
+
+```
+output/
+└── {podcast_name}/
+    ├── clip_1_8.mp4        # clip_N_score.mp4
+    ├── clip_2_7.mp4
+    ├── clip_3_6.mp4
+    ├── transcription.json  # Whisper word-level
+    └── results.json        # Métadonnées complètes
+```
+
+### Résumé final (exemple)
+
+```
+======================================================================
+  📊 FINAL SUMMARY
+======================================================================
+  ✅ Clips generated  : 3
+  ❌ Clips failed     : 0
+  ⏱️  Total time       : 187s (3.1 min)
+  💰 Estimated cost   : ~$0.0234 USD
+  📁 Output dir       : ./output/podcast_name/
+     📹 clip_1_8.mp4 (67s, 42.3 MB)
+     📹 clip_2_7.mp4 (71s, 45.1 MB)
+     📹 clip_3_6.mp4 (58s, 36.8 MB)
+======================================================================
+```
+
+### Worker Supabase
 
 `pipeline_v2.py` — Tourne sur Mac Mini, orchestré par `clip_worker.py` :
 - 🎙️ Download audio/video (yt-dlp ou URL directe)
